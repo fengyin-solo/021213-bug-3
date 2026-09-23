@@ -75,13 +75,13 @@
           </svg>
         </button>
         <div class="toolbar__divider" />
-        <button class="toolbar__btn" :disabled="scale <= 0.25" @click="zoomOut" title="缩小">
+        <button class="toolbar__btn" :disabled="scale <= MIN_SCALE" @click="zoomOut" title="缩小">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
             <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/>
           </svg>
         </button>
         <span class="toolbar__zoom-value">{{ Math.round(scale * 100) }}%</span>
-        <button class="toolbar__btn" :disabled="scale >= 5" @click="zoomIn" title="放大">
+        <button class="toolbar__btn" :disabled="scale >= MAX_SCALE" @click="zoomIn" title="放大">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
             <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/>
           </svg>
@@ -188,7 +188,7 @@ import {
   loadPdfDocument, renderPageToCanvas, buildTextLayer,
   buildAnnotationLayer, preloadPdfjs, getPageBaseDimensions,
   searchDocument, buildHighlightLayer, clearHighlightLayer,
-  type PdfjsDocument, type PdfjsPage, type PdfjsViewport,
+  type PdfjsDocument, type PdfjsPage,
   type SearchResult, type SearchMatch, type PageSearchResult,
 } from '@/utils/pdf-engine'
 
@@ -198,10 +198,15 @@ const sampleFiles = [
   { name: 'document.pdf', label: '示例三：图文混排' },
 ]
 
+/* ---- 缩放范围（适合宽度计算结果也会被限制在此范围内，与放大/缩小按钮一致） ---- */
+const MIN_SCALE = 0.25
+const MAX_SCALE = 5
+const DEFAULT_SCALE = 1.5
+
 /* ---- 响应式状态 ---- */
 const pdfDoc = ref<PdfjsDocument | null>(null)
 const totalPages = ref(0)
-const scale = ref(1.5)
+const scale = ref(DEFAULT_SCALE)
 const loading = ref(false)
 const errorMsg = ref('')
 const fileName = ref('')
@@ -254,7 +259,6 @@ const MAX_RENDERED = 15
 let toastTimer: ReturnType<typeof setTimeout> | null = null
 let renderVersion = 0
 let scrollRafId: number | null = null
-let highlightVersion = 0
 
 /* ---- Ref 绑定 ---- */
 function setCanvasRef(el: HTMLCanvasElement | null, n: number) { if (el) canvasRefs.set(n, el) }
@@ -341,14 +345,12 @@ function clearSearch() {
 }
 
 function clearAllHighlights() {
-  highlightVersion++
   for (const container of highlightLayerRefs.values()) {
     clearHighlightLayer(container)
   }
 }
 
 function refreshHighlights() {
-  const ver = ++highlightVersion
   const matchesByPage = new Map<number, SearchMatch[]>()
   for (const match of allMatches.value) {
     if (!matchesByPage.has(match.pageNumber)) {
@@ -357,32 +359,35 @@ function refreshHighlights() {
     matchesByPage.get(match.pageNumber)!.push(match)
   }
 
-  for (const [pageNum, matches] of matchesByPage) {
-    const container = highlightLayerRefs.get(pageNum)
-    if (!container) continue
-
-    const base = pageBaseDims.get(pageNum)
-    if (!base) continue
-
-    const viewport = {
-      width: base.baseWidth * scale.value,
-      height: base.baseHeight * scale.value,
-      scale: scale.value,
-      rotation: 0,
-      transform: [1, 0, 0, 1, 0, 0],
-      clone: () => ({ /* 简化的 clone，实际高亮层不需要完整 viewport */ }),
-    } as unknown as PdfjsViewport
-
-    let pageCurrentIdx: number | undefined
-    if (currentMatchIndex.value >= 0 && currentMatchIndex.value < allMatches.value.length) {
-      const currentMatch = allMatches.value[currentMatchIndex.value]
-      if (currentMatch && currentMatch.pageNumber === pageNum) {
-        pageCurrentIdx = currentMatch.matchIndex
-      }
-    }
-
-    buildHighlightLayer(container, matches, viewport, pageCurrentIdx)
+  for (const pageNum of matchesByPage.keys()) {
+    void rebuildPageHighlights(pageNum)
   }
+}
+
+/**
+ * 用真实 viewport 重建某一页的高亮层。
+ * 必须使用真实 viewport（其 transform 包含 PDF→屏幕坐标的 Y 翻转），
+ * 否则高亮矩形与 text layer 的透明文字不在同一坐标系，放大后会明显错位。
+ */
+async function rebuildPageHighlights(pageNum: number) {
+  if (searchResult.totalMatches === 0) return
+  const container = highlightLayerRefs.get(pageNum)
+  const doc = pdfDoc.value
+  if (!container || !doc) return
+
+  const matches = searchResult.pages.find((p) => p.pageNumber === pageNum)?.matches
+  if (!matches || matches.length === 0) {
+    clearHighlightLayer(container)
+    return
+  }
+
+  const current = getCurrentMatch()
+  const pageCurrentIdx = current?.pageNumber === pageNum ? current.matchIndex : undefined
+
+  const page = await doc.getPage(pageNum)
+  // getPage 为异步操作，等待期间可能已切换缩放比例；取 viewport 时用当前比例
+  const viewport = page.getViewport({ scale: scale.value })
+  buildHighlightLayer(container, matches, viewport, pageCurrentIdx)
 }
 
 function getCurrentMatch(): SearchMatch | null {
@@ -433,12 +438,17 @@ function jumpToMatch(match: SearchMatch) {
   const wrapper = pageWrapperRefs.get(match.pageNumber)
   if (!wrapper || !containerRef.value) return
 
-  const containerTop = containerRef.value.scrollTop
+  const base = pageBaseDims.get(match.pageNumber)
+
   const containerHeight = containerRef.value.clientHeight
   const wrapperTop = wrapper.offsetTop
-  const wrapperHeight = wrapper.offsetHeight
 
-  const matchTop = match.transform[5] * scale.value
+  // transform[5] 是 PDF 坐标系（原点在左下角）下的基线 Y 值，
+  // 需按 viewport 的 Y 翻转换算成屏幕坐标：screenY = pageHeight - pdfY
+  const s = scale.value
+  const matchTop = base
+    ? base.baseHeight * s - match.transform[5] * s
+    : 0
   const targetTop = wrapperTop + matchTop - containerHeight / 2
 
   containerRef.value.scrollTo({
@@ -477,15 +487,19 @@ function highlightMatchText(match: SearchMatch, pageText: string): string {
 }
 
 /* ---- 缩放 ---- */
-function zoomIn() { if (scale.value < 5) scale.value = Math.min(5, +(scale.value + 0.25).toFixed(2)) }
-function zoomOut() { if (scale.value > 0.25) scale.value = Math.max(0.25, +(scale.value - 0.25).toFixed(2)) }
+function clampScale(s: number) {
+  return Math.min(MAX_SCALE, Math.max(MIN_SCALE, +s.toFixed(2)))
+}
+function zoomIn() { if (scale.value < MAX_SCALE) scale.value = clampScale(scale.value + 0.25) }
+function zoomOut() { if (scale.value > MIN_SCALE) scale.value = clampScale(scale.value - 0.25) }
 function fitWidth() {
   if (!containerRef.value || !pdfDoc.value) return
   const containerWidth = containerRef.value.clientWidth - 64
   // 使用第一页的基础宽度（scale=1）计算适合宽度的缩放比
   const base = pageBaseDims.get(1)
-  if (!base) return
-  scale.value = +(containerWidth / base.baseWidth).toFixed(2)
+  if (!base || base.baseWidth <= 0) return
+  // 限制在与放大/缩小按钮相同的范围内，避免窄窗口/宽页面时出现极端比例
+  scale.value = clampScale(containerWidth / base.baseWidth)
 }
 
 /* ---- 页面尺寸 ---- */
@@ -574,6 +588,20 @@ async function renderPage(n: number, ver: number) {
   if (ver !== renderVersion) return
 
   if (annoDiv) await buildAnnotationLayer(page, annoDiv, viewport)
+
+  // 页面可能因 LRU 回收被清空过（包括高亮层），渲染完成后需按当前比例重建高亮，
+  // 保证滚动回到该页时高亮与文字仍然对齐
+  if (searchResult.totalMatches > 0) {
+    const hlDiv = highlightLayerRefs.get(n)
+    const matches = searchResult.pages.find((p) => p.pageNumber === n)?.matches
+    if (hlDiv && matches && matches.length > 0) {
+      const current = getCurrentMatch()
+      buildHighlightLayer(
+        hlDiv, matches, viewport,
+        current?.pageNumber === n ? current.matchIndex : undefined,
+      )
+    }
+  }
 
   renderedPages.add(key)
   const idx = renderedPageOrder.indexOf(n)
@@ -668,6 +696,10 @@ async function loadPdf(url: string) {
   annotationLayerRefs.clear(); highlightLayerRefs.clear()
   pageWrapperRefs.clear()
 
+  // 先卸掉旧文档再复位缩放，避免 scale 复位的 watcher 对旧文档触发一次渲染
+  pdfDoc.value = null
+  totalPages.value = 0
+
   searchCancelled.value = true
   searching.value = false
   searchKeyword.value = ''
@@ -681,6 +713,10 @@ async function loadPdf(url: string) {
   })
   expandedPages.clear()
 
+  // 复位缩放比例与滚动位置（此时 pdfDoc 已为空，watcher 不会触发旧文档重渲染）
+  scale.value = DEFAULT_SCALE
+  if (containerRef.value) containerRef.value.scrollTop = 0
+
   try {
     const doc = await loadPdfDocument(url)
     pdfDoc.value = doc
@@ -690,6 +726,8 @@ async function loadPdf(url: string) {
     loading.value = false
     showToast(`加载成功，共 ${doc.numPages} 页`, 'success')
     await nextTick()
+    // 新文档内容替换后再次回到顶部，保证滚动位置与画面一致
+    if (containerRef.value) containerRef.value.scrollTop = 0
     setTimeout(scheduleRender, 50)
   } catch (e: unknown) {
     loading.value = false

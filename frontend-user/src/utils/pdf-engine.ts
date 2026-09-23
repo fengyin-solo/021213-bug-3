@@ -459,16 +459,11 @@ export function buildHighlightLayer(
         highlight.classList.add('search-highlight--active')
       }
 
-      const [scaleX, skewX, skewY, scaleY, translateX, translateY] = fragment.transform
-
-      const scaledTransform = [
-        scaleX * viewport.scale,
-        skewX * viewport.scale,
-        skewY * viewport.scale,
-        scaleY * viewport.scale,
-        translateX * viewport.scale,
-        translateY * viewport.scale,
-      ]
+      // fragment.transform 位于 PDF 坐标系（原点左下角、Y 轴向上），
+      // 必须与 viewport.transform（包含缩放与 Y 翻转）做矩阵合成，
+      // 与 PDF.js text layer 的 Util.transform(viewport.transform, geom.transform)
+      // 使用完全相同的坐标系，保证任意缩放比下高亮与文字像素级对齐。
+      const m = composeTransform(viewport.transform, fragment.transform)
 
       const width = fragment.width * viewport.scale
       const height = fragment.height * viewport.scale
@@ -479,7 +474,7 @@ export function buildHighlightLayer(
         top: 0;
         width: ${width}px;
         height: ${height}px;
-        transform: matrix(${scaledTransform.join(',')});
+        transform: matrix(${m.join(',')});
         transform-origin: 0% 0%;
         background: rgba(255, 235, 59, 0.55);
         border-radius: 2px;
@@ -489,6 +484,21 @@ export function buildHighlightLayer(
       container.appendChild(highlight)
     }
   }
+}
+
+/**
+ * 2D 仿射矩阵合成，等价于 PDF.js 的 Util.transform(m1, m2)。
+ * 返回结果表示先应用 m2 再应用 m1。
+ */
+function composeTransform(m1: number[], m2: number[]): number[] {
+  return [
+    m1[0] * m2[0] + m1[2] * m2[1],
+    m1[1] * m2[0] + m1[3] * m2[1],
+    m1[0] * m2[2] + m1[2] * m2[3],
+    m1[1] * m2[2] + m1[3] * m2[3],
+    m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
+    m1[1] * m2[4] + m1[3] * m2[5] + m1[5],
+  ]
 }
 
 /**
