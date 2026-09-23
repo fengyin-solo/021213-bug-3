@@ -103,6 +103,9 @@ declare global {
   interface Window {
     pdfjsLib?: {
       GlobalWorkerOptions: { workerSrc: string }
+      Util: {
+        transform(m1: number[], m2: number[]): number[]
+      }
       getDocument(params: Record<string, unknown>): { promise: Promise<PdfjsDocument> }
       renderTextLayer(params: {
         textContent: PdfjsTextContent
@@ -449,6 +452,8 @@ export function buildHighlightLayer(
   container.style.pointerEvents = 'none'
   container.style.zIndex = '4'
 
+  const pdfjs = getPdfjs()
+
   for (const match of matches) {
     const isActive = match.matchIndex === currentMatchIndex
 
@@ -459,16 +464,14 @@ export function buildHighlightLayer(
         highlight.classList.add('search-highlight--active')
       }
 
+      // 与 PDF.js 文本层完全一致的坐标合成：
+      // 先把文本项自身的平移并入其变换矩阵，再与 viewport.transform
+      // （含 Y 轴翻转）做矩阵乘法，保证高亮与文字在任意缩放下像素级对齐。
       const [scaleX, skewX, skewY, scaleY, translateX, translateY] = fragment.transform
-
-      const scaledTransform = [
-        scaleX * viewport.scale,
-        skewX * viewport.scale,
-        skewY * viewport.scale,
-        scaleY * viewport.scale,
-        translateX * viewport.scale,
-        translateY * viewport.scale,
-      ]
+      const geomTransform = [scaleX, skewX, skewY, scaleY, translateX, translateY]
+      const combined = pdfjs.Util
+        ? pdfjs.Util.transform(viewport.transform, geomTransform)
+        : fallbackCompose(viewport.transform, geomTransform)
 
       const width = fragment.width * viewport.scale
       const height = fragment.height * viewport.scale
@@ -479,7 +482,7 @@ export function buildHighlightLayer(
         top: 0;
         width: ${width}px;
         height: ${height}px;
-        transform: matrix(${scaledTransform.join(',')});
+        transform: matrix(${combined.join(',')});
         transform-origin: 0% 0%;
         background: rgba(255, 235, 59, 0.55);
         border-radius: 2px;
@@ -489,6 +492,18 @@ export function buildHighlightLayer(
       container.appendChild(highlight)
     }
   }
+}
+
+/** 与 PDF.js Util.transform(m1, m2) 相同的 2D 仿射矩阵乘法（m1 × m2） */
+function fallbackCompose(m1: number[], m2: number[]): number[] {
+  return [
+    m1[0] * m2[0] + m1[2] * m2[1],
+    m1[1] * m2[0] + m1[3] * m2[1],
+    m1[0] * m2[2] + m1[2] * m2[3],
+    m1[1] * m2[2] + m1[3] * m2[3],
+    m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
+    m1[1] * m2[4] + m1[3] * m2[5] + m1[5],
+  ]
 }
 
 /**
